@@ -421,17 +421,30 @@ VCACHE_TEST(ConcurrentReadsPromoteWithoutCorruptingTheList) {
     // Many threads promoting the same small set of keys at once: if the recency
     // list were unguarded, its pointers would tangle and eviction would either
     // loop or lose entries.
+    //
+    // Every thread does a BOUNDED amount of work, deliberately. An earlier
+    // version ran the readers in `while (!stop)` loops and let the writer set
+    // the flag when it finished. That deadlocked in practice on Linux: glibc's
+    // std::shared_mutex prefers readers, so eight threads continuously taking
+    // the shared lock starved the writer, the writer never reached the flag,
+    // and the readers never stopped. It passed on macOS, where libc++ lets the
+    // writer in, and CI caught it on the first Linux run.
+    //
+    // The starvation is a real property of a single reader/writer lock, not a
+    // test artifact -- see the note in Database.h. Bounding the loops means
+    // this test measures recency-list integrity rather than lock fairness.
     Database db;
     db.setMaxMemory(limitForEntries(20));
     for (int i = 0; i < 10; ++i) {
         db.set("shared" + std::to_string(i), valueOfSize(kValueSize));
     }
 
-    std::atomic<bool> stop{false};
+    constexpr int kReadRounds = 500;
+
     std::vector<std::thread> readers;
     for (int t = 0; t < 8; ++t) {
-        readers.emplace_back([&db, &stop] {
-            while (!stop.load()) {
+        readers.emplace_back([&db] {
+            for (int round = 0; round < kReadRounds; ++round) {
                 for (int i = 0; i < 10; ++i) {
                     db.get("shared" + std::to_string(i));
                 }
@@ -439,13 +452,16 @@ VCACHE_TEST(ConcurrentReadsPromoteWithoutCorruptingTheList) {
         });
     }
 
-    for (int i = 0; i < 500; ++i) {
-        db.set("churn" + std::to_string(i), valueOfSize(kValueSize));
-    }
-    stop.store(true);
+    std::thread writer([&db] {
+        for (int i = 0; i < 500; ++i) {
+            db.set("churn" + std::to_string(i), valueOfSize(kValueSize));
+        }
+    });
+
     for (std::thread& reader : readers) {
         reader.join();
     }
+    writer.join();
 
     CHECK(db.memoryUsage() <= db.maxMemory());
     CHECK_EQ(db.keys().size(), db.size());

@@ -9,8 +9,9 @@ function(vcache_add_test name)
 
     add_test(NAME ${name} COMMAND ${name})
 
-    # A socket bug should fail the suite, not wedge it forever.
-    set_tests_properties(${name} PROPERTIES TIMEOUT 120)
+    # A socket bug or a deadlock should fail the suite, not wedge it forever.
+    # Generous enough for sanitizer builds, which run several times slower.
+    set_tests_properties(${name} PROPERTIES TIMEOUT 300)
 endfunction()
 
 vcache_add_test(test_hashtable)

@@ -84,6 +84,14 @@ enum class SetOutcome {
 // a plain mutex, so on a write-heavy workload it can lose. Phase 9 should
 // measure all three options: plain mutex, this, and per-shard locks.
 //
+// WRITER STARVATION, and it is platform-dependent. glibc's std::shared_mutex
+// prefers readers, so a continuous stream of readers can block a writer
+// indefinitely; libc++ on macOS admits the writer. A test with unbounded reader
+// loops deadlocked on Linux and passed on macOS until CI ran both. Real clients
+// pause between requests so this is unlikely to bite in production, but it is a
+// genuine property of putting one reader/writer lock over the whole keyspace,
+// and one more reason sharding is the right next change.
+//
 // The lock lives HERE and not in HashTable. Locking the container would mean
 // every operation takes the lock separately, so a read-modify-write across two
 // calls would still race, and single-threaded users would pay for a lock they
