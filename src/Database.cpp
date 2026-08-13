@@ -1,5 +1,6 @@
 #include "Database.h"
 
+#include <algorithm>
 #include <mutex>
 #include <shared_mutex>
 
@@ -8,106 +9,146 @@ namespace vcache {
 namespace {
 
 // Naming the two lock kinds makes each method's intent obvious at a glance:
-// ReadLock means "others may read alongside me", WriteLock means "I am alone".
+// ReadLock means "others may read this shard alongside me", WriteLock means "I
+// am alone in this shard".
 using ReadLock = std::shared_lock<std::shared_mutex>;
 using WriteLock = std::unique_lock<std::shared_mutex>;
 
+std::size_t roundUpToPowerOfTwo(std::size_t n) noexcept {
+    std::size_t result = 1;
+    while (result < n) {
+        result *= 2;
+    }
+    return result;
+}
+
+unsigned log2OfPowerOfTwo(std::size_t n) noexcept {
+    unsigned bits = 0;
+    while ((std::size_t{1} << bits) < n) {
+        ++bits;
+    }
+    return bits;
+}
+
 }  // namespace
 
-Database::Database(std::size_t initialBucketCount) : table_(initialBucketCount) {}
+Database::Database(std::size_t initialBucketCount, std::size_t shardCount) {
+    const std::size_t shards = roundUpToPowerOfTwo(std::max<std::size_t>(shardCount, 1));
+
+    // The caller's bucket count is the total, so each shard starts with its
+    // share. HashTable rounds its own count up to a power of two and enforces a
+    // floor, so a small share is harmless.
+    const std::size_t bucketsPerShard = std::max<std::size_t>(initialBucketCount / shards, 1);
+
+    shards_.reserve(shards);
+    for (std::size_t i = 0; i < shards; ++i) {
+        shards_.push_back(std::make_unique<Shard>(bucketsPerShard));
+    }
+
+    if (shards > 1) {
+        shardMask_ = shards - 1;
+        shardShift_ = 64 - log2OfPowerOfTwo(shards);
+    }
+}
+
+std::size_t Database::shardIndexFor(const std::string& key) const noexcept {
+    if (shardMask_ == 0) {
+        return 0;  // single shard; also avoids a shift of 64, which is UB
+    }
+
+    // The HIGH bits. HashTable::bucketIndexFor masks the LOW bits, so drawing
+    // both from the same end would put every key in a shard into one bucket.
+    // hashKey already applies an avalanche step, so the top bits are as well
+    // mixed as the bottom.
+    return static_cast<std::size_t>(HashTable::hashKey(key) >> shardShift_) & shardMask_;
+}
+
+Database::Shard& Database::shardFor(const std::string& key) noexcept {
+    return *shards_[shardIndexFor(key)];
+}
+
+const Database::Shard& Database::shardFor(const std::string& key) const noexcept {
+    return *shards_[shardIndexFor(key)];
+}
+
+bool Database::fitsWithinLimit(const std::string& key, const std::string& value) const {
+    const std::size_t limit = maxMemoryBytes_.load();
+    if (limit == 0) {
+        return true;
+    }
+
+    // Judged against the GLOBAL limit rather than the shard's slice. Comparing
+    // against the slice looked reasonable and was wrong: with 64 shards and a
+    // budget sized for 50 entries, each slice held less than one entry, so
+    // every single write was rejected while the database sat empty.
+    //
+    // Checked BEFORE inserting -- inserting first and then discovering the
+    // entry can never fit would mean evicting a shard to make room for
+    // something that still does not fit.
+    return HashTable::footprintEstimate(key, value) <= limit;
+}
+
+void Database::evictToFit(Shard& shard) {
+    if (shard.maxMemoryBytes == 0) {
+        return;
+    }
+
+    // Stops at one entry rather than zero: the bucket array counts toward usage
+    // and never shrinks, so a slice smaller than the array alone would
+    // otherwise spin evicting nothing.
+    while (shard.table.memoryUsage() > shard.maxMemoryBytes && shard.table.size() > 1) {
+        if (!shard.table.evictOldest().has_value()) {
+            break;
+        }
+        ++shard.evicted;
+    }
+}
 
 SetOutcome Database::set(const std::string& key, const std::string& value) {
     // No validation here on purpose. Empty keys and binary values are legal
-    // storage; rejecting malformed *commands* (wrong arity, unknown verb, bad
-    // TTL) is the command parser's job. Splitting it that way keeps one place
-    // to look when a client gets an error.
-    WriteLock lock(mutex_);
+    // storage; rejecting malformed *commands* is the parser's job.
+    Shard& shard = shardFor(key);
+    WriteLock lock(shard.mutex);
 
-    if (!fitsWithinLimitLocked(key, value)) {
+    if (!fitsWithinLimit(key, value)) {
         return SetOutcome::Rejected;
     }
 
     // put() clears any previous expiration, so this makes the key persistent.
-    const bool inserted = table_.put(key, value);
-    evictToFitLocked();
+    const bool inserted = shard.table.put(key, value);
+    evictToFit(shard);
     return inserted ? SetOutcome::Inserted : SetOutcome::Updated;
 }
 
-SetOutcome Database::set(const std::string& key, const std::string& value,
+SetOutcome Database::set(const std::string& key,
+                         const std::string& value,
                          std::chrono::seconds ttl) {
-    WriteLock lock(mutex_);
+    Shard& shard = shardFor(key);
+    WriteLock lock(shard.mutex);
 
-    if (!fitsWithinLimitLocked(key, value)) {
+    if (!fitsWithinLimit(key, value)) {
         return SetOutcome::Rejected;
     }
 
-    const bool inserted = table_.put(key, value);
+    const bool inserted = shard.table.put(key, value);
 
-    // put() just reset the expiration, so setting it afterwards is what turns
-    // this into an expiring key. find() cannot fail here -- put() guarantees
-    // the entry exists.
-    Entry* entry = table_.find(key);
-    entry->expiration = Clock::now() + ttl;
+    // put() just reset the expiration, so setting it afterwards is what makes
+    // this an expiring key. find() cannot fail -- put() guarantees the entry.
+    shard.table.find(key)->expiration = Clock::now() + ttl;
 
-    evictToFitLocked();
+    evictToFit(shard);
     return inserted ? SetOutcome::Inserted : SetOutcome::Updated;
 }
 
-bool Database::fitsWithinLimitLocked(const std::string& key, const std::string& value) const {
-    if (maxMemoryBytes_ == 0) {
-        return true;
-    }
-    // Checked BEFORE inserting rather than after. Inserting first and then
-    // discovering the entry can never fit would mean evicting the whole
-    // keyspace to make room for something that still does not fit.
-    return HashTable::footprintEstimate(key, value) <= maxMemoryBytes_;
-}
-
-void Database::evictToFitLocked() {
-    if (maxMemoryBytes_ == 0) {
-        return;
-    }
-
-    // Stops at one entry rather than zero: the bucket array is counted in
-    // usage and never shrinks, so a limit smaller than the bucket array alone
-    // would otherwise spin evicting nothing.
-    while (table_.memoryUsage() > maxMemoryBytes_ && table_.size() > 1) {
-        if (!table_.evictOldest().has_value()) {
-            break;
-        }
-        ++evictedCount_;
-    }
-}
-
-void Database::setMaxMemory(std::size_t bytes) {
-    WriteLock lock(mutex_);
-    maxMemoryBytes_ = bytes;
-    evictToFitLocked();  // a tightened limit applies immediately
-}
-
-std::size_t Database::maxMemory() const {
-    ReadLock lock(mutex_);
-    return maxMemoryBytes_;
-}
-
-std::size_t Database::memoryUsage() const {
-    ReadLock lock(mutex_);
-    return table_.memoryUsage();
-}
-
-std::size_t Database::evictedCount() const {
-    ReadLock lock(mutex_);
-    return evictedCount_;
-}
-
 std::optional<std::string> Database::get(const std::string& key) {
-    ReadLock lock(mutex_);
+    Shard& shard = shardFor(key);
+    ReadLock lock(shard.mutex);
 
-    const Entry* entry = table_.find(key);
+    const Entry* entry = shard.table.find(key);
     if (entry == nullptr || entry->isExpiredAt(Clock::now())) {
-        // Expired entries are reported absent but deliberately left in place:
-        // this is a shared lock, and the sweeper does the reclaiming. An
-        // expired key is also not a "use", so it is not promoted.
+        // Expired entries are reported absent but left in place: this is a
+        // shared lock, and the sweeper does the reclaiming. A miss is also not
+        // a use, so nothing is promoted.
         return std::nullopt;
     }
 
@@ -117,19 +158,20 @@ std::optional<std::string> Database::get(const std::string& key) {
 
     // A read counts as a use. This mutates the recency list while holding only
     // a SHARED lock, which is safe because that list carries its own mutex --
-    // see the note on HashTable. Skipped entirely when no limit is set, so a
-    // database without eviction pays nothing for it.
-    if (maxMemoryBytes_ != 0) {
-        table_.touch(key);
+    // see the note on HashTable. Skipped when no limit is set, so a database
+    // without eviction pays nothing for it.
+    if (shard.maxMemoryBytes != 0) {
+        shard.table.touch(key);
     }
 
     return value;
 }
 
 std::optional<std::chrono::seconds> Database::ttl(const std::string& key) {
-    ReadLock lock(mutex_);
+    const Shard& shard = shardFor(key);
+    ReadLock lock(shard.mutex);
 
-    const Entry* entry = table_.find(key);
+    const Entry* entry = shard.table.find(key);
     if (entry == nullptr || !entry->hasExpiration()) {
         return std::nullopt;
     }
@@ -144,9 +186,10 @@ std::optional<std::chrono::seconds> Database::ttl(const std::string& key) {
 }
 
 bool Database::del(const std::string& key) {
-    WriteLock lock(mutex_);
+    Shard& shard = shardFor(key);
+    WriteLock lock(shard.mutex);
 
-    const Entry* entry = table_.find(key);
+    const Entry* entry = shard.table.find(key);
     if (entry == nullptr) {
         return false;
     }
@@ -154,81 +197,147 @@ bool Database::del(const std::string& key) {
     // An expired key is reclaimed but reported as a miss, so DEL agrees with
     // what EXISTS would have said a moment earlier.
     const bool wasLive = !entry->isExpiredAt(Clock::now());
-    table_.remove(key);
+    shard.table.remove(key);
     return wasLive;
 }
 
 bool Database::exists(const std::string& key) {
-    ReadLock lock(mutex_);
+    const Shard& shard = shardFor(key);
+    ReadLock lock(shard.mutex);
 
-    const Entry* entry = table_.find(key);
+    const Entry* entry = shard.table.find(key);
     return entry != nullptr && !entry->isExpiredAt(Clock::now());
 }
 
 std::vector<std::string> Database::keys() {
-    ReadLock lock(mutex_);
+    std::vector<std::string> result;
 
-    // One `now` for the whole scan, so a slow walk cannot report a key as live
-    // at the start and expired at the end of the same snapshot.
-    const Clock::time_point now = Clock::now();
+    // One shard at a time. Holding every lock at once would give a true
+    // point-in-time snapshot at the cost of stalling the whole database, which
+    // is a bad trade for a debugging command.
+    for (const auto& shard : shards_) {
+        ReadLock lock(shard->mutex);
 
-    // Builds the whole vector under the lock, so callers get a consistent
-    // snapshot rather than a view that shifts while they iterate it.
-    return table_.keysWhere([now](const Entry& entry) { return !entry.isExpiredAt(now); });
+        // One `now` per shard, so a slow walk cannot call a key live at the
+        // start and expired at the end of the same shard's scan.
+        const Clock::time_point now = Clock::now();
+        std::vector<std::string> fromShard =
+            shard->table.keysWhere([now](const Entry& entry) { return !entry.isExpiredAt(now); });
+
+        result.insert(result.end(), std::make_move_iterator(fromShard.begin()),
+                      std::make_move_iterator(fromShard.end()));
+    }
+    return result;
 }
 
 std::size_t Database::size() const {
-    ReadLock lock(mutex_);
-    return table_.size();
+    std::size_t total = 0;
+    for (const auto& shard : shards_) {
+        ReadLock lock(shard->mutex);
+        total += shard->table.size();
+    }
+    return total;
 }
 
 bool Database::empty() const {
-    ReadLock lock(mutex_);
-    return table_.empty();
+    for (const auto& shard : shards_) {
+        ReadLock lock(shard->mutex);
+        if (!shard->table.empty()) {
+            return false;  // early exit; no need to visit the rest
+        }
+    }
+    return true;
 }
 
 std::size_t Database::bucketCount() const {
-    ReadLock lock(mutex_);
-    return table_.bucketCount();
+    std::size_t total = 0;
+    for (const auto& shard : shards_) {
+        ReadLock lock(shard->mutex);
+        total += shard->table.bucketCount();
+    }
+    return total;
+}
+
+std::size_t Database::memoryUsage() const {
+    std::size_t total = 0;
+    for (const auto& shard : shards_) {
+        ReadLock lock(shard->mutex);
+        total += shard->table.memoryUsage();
+    }
+    return total;
+}
+
+std::size_t Database::evictedCount() const {
+    std::size_t total = 0;
+    for (const auto& shard : shards_) {
+        ReadLock lock(shard->mutex);
+        total += shard->evicted;
+    }
+    return total;
 }
 
 std::size_t Database::removeExpired(std::size_t maxBuckets) {
-    WriteLock lock(mutex_);
-
-    const std::size_t buckets = table_.bucketCount();
-    if (buckets == 0 || maxBuckets == 0) {
+    if (maxBuckets == 0) {
         return 0;
     }
 
-    // The table may have grown or shrunk since the last pass, leaving the
-    // cursor out of range. Wrapping is enough: a rehash only moves entries
-    // between buckets, so anything skipped is caught on a later pass.
-    if (sweepCursor_ >= buckets) {
-        sweepCursor_ = 0;
+    // The budget is split so one call still scans a bounded slice overall, not
+    // a bounded slice per shard multiplied by the shard count.
+    const std::size_t perShard = std::max<std::size_t>(maxBuckets / shards_.size(), 1);
+    std::size_t removed = 0;
+
+    for (const auto& shard : shards_) {
+        WriteLock lock(shard->mutex);
+
+        const std::size_t buckets = shard->table.bucketCount();
+        if (buckets == 0) {
+            continue;
+        }
+
+        // The table may have grown since the last pass, leaving the cursor out
+        // of range. Wrapping is enough: a rehash only moves entries between
+        // buckets, so anything skipped is caught on a later pass.
+        if (shard->sweepCursor >= buckets) {
+            shard->sweepCursor = 0;
+        }
+
+        const Clock::time_point now = Clock::now();
+        const std::size_t scanned = std::min(perShard, buckets);
+
+        removed += shard->table.removeIf(shard->sweepCursor, scanned,
+                                         [now](const Entry& entry) {
+                                             return entry.isExpiredAt(now);
+                                         });
+
+        shard->sweepCursor = (shard->sweepCursor + scanned) % buckets;
     }
 
-    const Clock::time_point now = Clock::now();
-    const std::size_t scanned = std::min(maxBuckets, buckets);
-
-    const std::size_t removed = table_.removeIf(
-        sweepCursor_, scanned, [now](const Entry& entry) { return entry.isExpiredAt(now); });
-
-    sweepCursor_ = (sweepCursor_ + scanned) % buckets;
     return removed;
 }
 
 std::vector<Entry> Database::snapshot() const {
-    ReadLock lock(mutex_);
+    std::vector<Entry> result;
 
-    const Clock::time_point now = Clock::now();
-    return table_.entriesWhere([now](const Entry& entry) { return !entry.isExpiredAt(now); });
+    for (const auto& shard : shards_) {
+        ReadLock lock(shard->mutex);
+
+        const Clock::time_point now = Clock::now();
+        std::vector<Entry> fromShard = shard->table.entriesWhere(
+            [now](const Entry& entry) { return !entry.isExpiredAt(now); });
+
+        result.insert(result.end(), std::make_move_iterator(fromShard.begin()),
+                      std::make_move_iterator(fromShard.end()));
+    }
+    return result;
 }
 
 std::size_t Database::restore(const std::vector<Entry>& entries) {
-    WriteLock lock(mutex_);
-
-    table_.clear();
-    sweepCursor_ = 0;
+    // Cleared first, in full, so a restore replaces rather than merges.
+    for (const auto& shard : shards_) {
+        WriteLock lock(shard->mutex);
+        shard->table.clear();
+        shard->sweepCursor = 0;
+    }
 
     const Clock::time_point now = Clock::now();
     std::size_t stored = 0;
@@ -240,10 +349,13 @@ std::size_t Database::restore(const std::vector<Entry>& entries) {
             continue;
         }
 
-        table_.put(entry.key, entry.value);
+        Shard& shard = shardFor(entry.key);
+        WriteLock lock(shard.mutex);
+
+        shard.table.put(entry.key, entry.value);
         if (entry.hasExpiration()) {
             // put() cleared the expiration, so it is reapplied here.
-            table_.find(entry.key)->expiration = entry.expiration;
+            shard.table.find(entry.key)->expiration = entry.expiration;
         }
         ++stored;
     }
@@ -251,10 +363,28 @@ std::size_t Database::restore(const std::vector<Entry>& entries) {
     return stored;
 }
 
+void Database::setMaxMemory(std::size_t bytes) {
+    // Divided evenly. With a well-mixed hash the shards hold similar amounts,
+    // so an even split is close to fair; the cost of being wrong is that a
+    // crowded shard evicts a little earlier than a global budget would.
+    const std::size_t perShard =
+        bytes == 0 ? 0 : std::max<std::size_t>(bytes / shards_.size(), 1);
+
+    for (const auto& shard : shards_) {
+        WriteLock lock(shard->mutex);
+        shard->maxMemoryBytes = perShard;
+        evictToFit(*shard);  // a tightened limit applies immediately
+    }
+
+    maxMemoryBytes_.store(bytes);
+}
+
 void Database::clear() {
-    WriteLock lock(mutex_);
-    table_.clear();
-    sweepCursor_ = 0;
+    for (const auto& shard : shards_) {
+        WriteLock lock(shard->mutex);
+        shard->table.clear();
+        shard->sweepCursor = 0;
+    }
 }
 
 }  // namespace vcache

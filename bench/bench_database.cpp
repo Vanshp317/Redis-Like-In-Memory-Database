@@ -292,6 +292,73 @@ void benchmarkEvictionOverhead(const std::vector<std::string>& keys) {
     }
 }
 
+// --- does sharding actually deliver scaling? ---------------------------------
+
+double shardedThroughputOnce(std::size_t shardCount, int threadCount,
+                             const std::vector<std::string>& keys) {
+    Database db(1024, shardCount);
+    const std::string value(64, 'v');
+    for (const std::string& key : keys) {
+        db.set(key, value);
+    }
+
+    const auto worker = [&](int threadIndex) {
+        std::size_t cursor = static_cast<std::size_t>(threadIndex) * 7919;
+        for (int i = 0; i < kOpsPerThread; ++i) {
+            const std::string& key = keys[cursor % keys.size()];
+            cursor += 31;
+            if (i % 100 < kReadPercent) {
+                auto found = db.get(key);
+                doNotOptimize(found);
+            } else {
+                db.set(key, value);
+            }
+        }
+    };
+
+    const auto start = bench::Clock::now();
+    std::vector<std::thread> threads;
+    for (int t = 0; t < threadCount; ++t) {
+        threads.emplace_back(worker, t);
+    }
+    for (std::thread& thread : threads) {
+        thread.join();
+    }
+    return static_cast<double>(threadCount) * kOpsPerThread / bench::secondsSince(start);
+}
+
+double shardedThroughput(std::size_t shardCount, int threadCount,
+                         const std::vector<std::string>& keys) {
+    std::vector<double> results;
+    for (int i = 0; i < 3; ++i) {
+        results.push_back(shardedThroughputOnce(shardCount, threadCount, keys));
+    }
+    std::sort(results.begin(), results.end());
+    return results[1];
+}
+
+void benchmarkSharding(const std::vector<std::string>& keys) {
+    std::cout << "  Same workload as above, through the real Database. One shard is the\n"
+                 "  old single-lock design; the rest show what splitting it bought.\n\n";
+
+    std::cout << std::left << std::setw(30) << "  shards" << std::right << std::setw(13)
+              << "1 thread" << std::setw(13) << "2 threads" << std::setw(13) << "4 threads"
+              << std::setw(13) << "8 threads" << "\n";
+    std::cout << "  " << std::string(80, '-') << "\n";
+
+    for (const std::size_t shardCount : {std::size_t{1}, std::size_t{4}, std::size_t{16},
+                                         std::size_t{64}}) {
+        std::cout << std::left << std::setw(30)
+                  << ("  " + std::to_string(shardCount) +
+                      (shardCount == 1 ? " (was the design)" : ""))
+                  << std::right << std::fixed << std::setprecision(0);
+        for (const int threads : {1, 2, 4, 8}) {
+            std::cout << std::setw(13) << shardedThroughput(shardCount, threads, keys);
+        }
+        std::cout << "\n";
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -310,6 +377,9 @@ int main() {
 
     bench::printHeading("Cost of LRU tracking on GET (ops/sec)");
     benchmarkEvictionOverhead(keys);
+
+    bench::printHeading("Sharding: does the database scale now? (ops/sec)");
+    benchmarkSharding(keys);
 
     return 0;
 }

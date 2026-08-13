@@ -26,10 +26,23 @@ using namespace std::chrono_literals;
 
 namespace {
 
-// Sweeps the whole table regardless of size, for tests that care about the
-// result rather than the incremental behaviour.
+// Sweeps until nothing more can be reclaimed, for tests that care about the
+// end state rather than the incremental behaviour.
+//
+// Repeats rather than passing one big budget because sharding made a single
+// call insufficient: removeExpired divides its budget evenly among shards, but
+// shards hold different numbers of buckets, so an even split leaves the larger
+// shards partly unswept.
 std::size_t sweepEverything(Database& db) {
-    return db.removeExpired(db.bucketCount());
+    // The budget is bucketCount * shardCount so that after dividing it evenly
+    // among shards, each shard's share still covers every bucket it owns --
+    // bucketCount() is the sum across shards, so it is at least as large as the
+    // biggest single shard.
+    //
+    // "Loop until a pass removes nothing" is NOT a correct stopping rule here:
+    // a pass scans only its slice of each shard, so it can legitimately remove
+    // nothing while expired entries wait in buckets it did not reach.
+    return db.removeExpired(db.bucketCount() * db.shardCount());
 }
 
 }  // namespace
@@ -229,11 +242,9 @@ VCACHE_TEST(SweepingIsIncrementalAndResumes) {
     CHECK(firstPass < std::size_t{500});   // only a slice was touched
     CHECK(db.size() > std::size_t{0});     // the rest is still there
 
-    // Enough further passes to cover the whole table.
-    std::size_t reclaimed = firstPass;
-    for (std::size_t pass = 0; pass < 8; ++pass) {
-        reclaimed += db.removeExpired(slice);
-    }
+    // Then a budget wide enough to cover every bucket of every shard, which
+    // finishes the job in one pass.
+    const std::size_t reclaimed = firstPass + sweepEverything(db);
 
     CHECK_EQ(reclaimed, std::size_t{500});
     CHECK_EQ(db.size(), std::size_t{0});

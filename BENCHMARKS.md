@@ -226,21 +226,65 @@ the server built on it.
 
 ---
 
+## 7. Sharding — the fix, and what it bought
+
+Everything above was measured against a single `std::shared_mutex` over the whole keyspace. That
+lock is now split into N independently locked shards, keyed by the high bits of the hash. Same
+workload, same machine, 90% reads:
+
+| Shards | 1 thread | 2 threads | 4 threads | 8 threads |
+|---|---:|---:|---:|---:|
+| **1** (the old design) | 2,538,548 | 2,725,126 | 2,162,647 | **1,016,706** |
+| 4 | 1,637,006 | 3,687,715 | 2,540,639 | 2,771,167 |
+| 16 | 2,089,617 | 4,576,484 | 7,194,973 | 5,108,002 |
+| **64** (the new default) | 2,451,218 | 5,896,433 | 8,652,340 | **10,690,837** |
+
+**10.5× at eight threads**, and throughput now climbs with thread count instead of peaking at two
+and collapsing. Single-threaded cost is about 4% — one extra shift and an indirection per
+operation — which is a trivial price.
+
+End to end, over real TCP with pipelining:
+
+| Pipelined SET | Before | After |
+|---|---:|---:|
+| 1 client | 652,233 | **812,497** |
+| 10 clients | 388,213 | **1,342,224** |
+| 50 clients | 259,266 | **1,359,288** |
+
+Before sharding, adding clients made pipelined throughput *worse* — the contention wall, visible
+from outside the process. It now scales.
+
+**The un-pipelined request/response numbers barely moved** (~215,000 ops/sec, unchanged). That is
+the correct result, not a disappointment: those are bound by one network round trip per command,
+which sharding has nothing to do with. Fixing a bottleneck only shows up where that bottleneck
+was.
+
+**What it cost.** Eviction became approximate global LRU — each shard trims its own slice, so the
+globally-oldest key can survive while a newer one elsewhere is evicted. Whole-keyspace operations
+(`KEYS`, `size()`, `snapshot()`) visit shards one at a time rather than freezing the world, so
+their totals need not match a single instant. And there is a capacity floor: eviction never takes
+a shard below one entry, so a database with N shards holds at least N entries and a memory limit
+below that cannot be honoured.
+
 ## What the numbers changed
 
 | Earlier claim | Verdict |
 |---|---|
 | A hand-written hash table is worth building | **Partly.** Slower on inserts and hits; 2.4× faster on misses; carries TTL/LRU metadata inline, which is what made later phases possible. |
 | `shared_mutex` beats a plain mutex for cache workloads | **Confirmed** up to 4 threads, **reversed** at 8. |
-| The design scales with threads | **Wrong.** Peak is ~2 threads. One global lock is the ceiling. |
+| The design scales with threads | **Was wrong, now fixed.** The single lock capped it at ~2 threads; sharding took it to 10.7M ops/sec at 8 threads (§7). |
 | Returning values by copy is an acceptable cost | **Confirmed for small values** (12%), **expensive for large** (89% at 4 KB). |
 | Strict LRU tracking is affordable | **Confirmed** — 3–31%, and not the bottleneck. |
 | The memory estimate is "good enough for eviction" | **Over-counts by 1.72×.** Conservative, but should be calibrated. |
 
-## The single highest-value next change
+## What is next
 
-Shard the lock. Every measurement points at the same wall: one `shared_mutex` over the whole
-keyspace caps this server at roughly two threads' worth of work, whatever else is optimised.
-Splitting the keyspace into N independently locked shards (chosen by the same hash already
-computed) would let reads and writes to different shards proceed in genuine parallel. Discovery
-Document §20 lists sharded hash tables under future work; these numbers say it should be first.
+Sharding is done (§7), and it was the change every measurement pointed at. What is left, in order:
+
+1. **Shrink the node** from 96 bytes toward `std::unordered_map`'s ~64. The TTL field and the two
+   recency pointers are what make the custom table lose on lookup hits (§1); packing the
+   expiration as a raw integer and dropping the cached footprint would recover roughly 16 bytes.
+2. **Calibrate the memory estimate**, which over-counts by 1.72× (§2).
+3. **Benchmark against real Redis** on this machine, so the ~200k ops/sec figure has a scale.
+4. **An event loop** (kqueue/epoll) to lift the one-worker-per-connection ceiling. Now that the
+   lock is no longer the bottleneck, this is what caps concurrent clients.

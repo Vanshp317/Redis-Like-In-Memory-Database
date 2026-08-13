@@ -46,6 +46,20 @@ std::size_t limitForEntries(std::size_t entries) {
     return entries * perEntry + vcache::HashTable::kDefaultBucketCount * sizeof(void*);
 }
 
+// Exact LRU ordering is a WITHIN-SHARD guarantee. With the keyspace split, the
+// globally-oldest key may live in a shard that is under its own budget and so
+// survives while a newer key elsewhere is evicted -- documented in Database.h
+// as approximate global LRU.
+//
+// The ordering tests below therefore use a single shard deliberately: they are
+// testing the eviction policy, not the sharding. Sharded behaviour has its own
+// tests at the end of this file.
+constexpr std::size_t kOneShard = 1;
+
+std::size_t singleShardBuckets() {
+    return vcache::HashTable::kDefaultBucketCount;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------- no limit set ----
@@ -120,7 +134,7 @@ VCACHE_TEST(ClearResetsAccounting) {
 // -------------------------------------------------------------- eviction ----
 
 VCACHE_TEST(ExceedingTheLimitEvicts) {
-    Database db;
+    Database db(singleShardBuckets(), kOneShard);
     db.setMaxMemory(limitForEntries(10));
 
     for (int i = 0; i < 100; ++i) {
@@ -136,7 +150,7 @@ VCACHE_TEST(ExceedingTheLimitEvicts) {
 VCACHE_TEST(TheLeastRecentlyUsedKeyIsTheOneEvicted) {
     // The core guarantee. Three keys, room for about two: writing a fourth must
     // take the oldest, not an arbitrary one.
-    Database db;
+    Database db(singleShardBuckets(), kOneShard);
     db.setMaxMemory(limitForEntries(3));
 
     db.set("first", valueOfSize(kValueSize));
@@ -156,7 +170,7 @@ VCACHE_TEST(TheLeastRecentlyUsedKeyIsTheOneEvicted) {
 VCACHE_TEST(ReadingAKeyProtectsItFromEviction) {
     // What separates LRU from FIFO. "first" was written earliest, but reading
     // it makes it the most recent, so "second" becomes the victim instead.
-    Database db;
+    Database db(singleShardBuckets(), kOneShard);
     db.setMaxMemory(limitForEntries(3));
 
     db.set("first", valueOfSize(kValueSize));
@@ -174,7 +188,7 @@ VCACHE_TEST(ReadingAKeyProtectsItFromEviction) {
 }
 
 VCACHE_TEST(OverwritingAKeyAlsoPromotesIt) {
-    Database db;
+    Database db(singleShardBuckets(), kOneShard);
     db.setMaxMemory(limitForEntries(3));
 
     db.set("first", valueOfSize(kValueSize));
@@ -191,7 +205,7 @@ VCACHE_TEST(OverwritingAKeyAlsoPromotesIt) {
 
 VCACHE_TEST(RepeatedReadsOfOneKeyKeepItAlive) {
     // A hot key must survive an arbitrary amount of churn around it.
-    Database db;
+    Database db(singleShardBuckets(), kOneShard);
     db.setMaxMemory(limitForEntries(5));
     db.set("hot", valueOfSize(kValueSize));
 
@@ -205,7 +219,7 @@ VCACHE_TEST(RepeatedReadsOfOneKeyKeepItAlive) {
 }
 
 VCACHE_TEST(EvictionOrderFollowsAccessOrderNotInsertionOrder) {
-    Database db;
+    Database db(singleShardBuckets(), kOneShard);
     db.setMaxMemory(limitForEntries(4));
 
     db.set("a", valueOfSize(kValueSize));
@@ -232,7 +246,7 @@ VCACHE_TEST(ExistsAndKeysDoNotCountAsUse) {
     // Documented behaviour: introspection is not access. If EXISTS promoted a
     // key, a monitoring loop calling EXISTS on everything would flatten the
     // recency order and make eviction arbitrary.
-    Database db;
+    Database db(singleShardBuckets(), kOneShard);
     db.setMaxMemory(limitForEntries(3));
 
     db.set("first", valueOfSize(kValueSize));
@@ -247,7 +261,7 @@ VCACHE_TEST(ExistsAndKeysDoNotCountAsUse) {
 }
 
 VCACHE_TEST(DeletingFreesRoomSoNothingIsEvicted) {
-    Database db;
+    Database db(singleShardBuckets(), kOneShard);
     db.setMaxMemory(limitForEntries(3));
 
     db.set("a", valueOfSize(kValueSize));
@@ -266,7 +280,7 @@ VCACHE_TEST(DeletingFreesRoomSoNothingIsEvicted) {
 // ------------------------------------------------------- limit management ----
 
 VCACHE_TEST(LoweringTheLimitEvictsImmediately) {
-    Database db;
+    Database db(singleShardBuckets(), kOneShard);
     for (int i = 0; i < 100; ++i) {
         db.set("key" + std::to_string(i), valueOfSize(kValueSize));
     }
@@ -280,7 +294,7 @@ VCACHE_TEST(LoweringTheLimitEvictsImmediately) {
 }
 
 VCACHE_TEST(RemovingTheLimitStopsEviction) {
-    Database db;
+    Database db(singleShardBuckets(), kOneShard);
     db.setMaxMemory(limitForEntries(5));
     for (int i = 0; i < 50; ++i) {
         db.set("key" + std::to_string(i), valueOfSize(kValueSize));
@@ -299,7 +313,7 @@ VCACHE_TEST(RemovingTheLimitStopsEviction) {
 VCACHE_TEST(AnEntryLargerThanTheLimitIsRejected) {
     // Storing it and then evicting it immediately would report success while
     // losing the data. Rejecting says so.
-    Database db;
+    Database db(singleShardBuckets(), kOneShard);
     db.setMaxMemory(4096);
 
     db.set("small", "fits");
@@ -321,7 +335,7 @@ VCACHE_TEST(SetOutcomeDistinguishesInsertFromUpdate) {
 VCACHE_TEST(ATinyLimitLeavesAtLeastOneKey) {
     // The bucket array counts toward usage and never shrinks, so a limit below
     // it would loop forever if eviction did not stop at one entry.
-    Database db;
+    Database db(singleShardBuckets(), kOneShard);
     db.setMaxMemory(1);
 
     db.set("key", "value");
@@ -333,7 +347,7 @@ VCACHE_TEST(ATinyLimitLeavesAtLeastOneKey) {
 // -------------------------------------------- interaction with other phases ----
 
 VCACHE_TEST(ExpiredKeysAreNotPromotedByAFailedRead) {
-    Database db;
+    Database db(singleShardBuckets(), kOneShard);
     db.setMaxMemory(limitForEntries(3));
 
     db.set("doomed", valueOfSize(kValueSize), 1s);
@@ -355,7 +369,8 @@ VCACHE_TEST(TheSweeperFreesMemoryForTheAccounting) {
     const std::size_t beforeExpiry = db.memoryUsage();
 
     std::this_thread::sleep_for(1200ms);
-    db.removeExpired(db.bucketCount());
+    // Wide enough that each shard's share covers all of its own buckets.
+    db.removeExpired(db.bucketCount() * db.shardCount());
 
     CHECK_EQ(db.size(), std::size_t{0});
     CHECK(db.memoryUsage() < beforeExpiry);
@@ -371,7 +386,7 @@ VCACHE_TEST(RestoringRebuildsRecencyInFileOrder) {
 
     const std::vector<vcache::Entry> entries = source.snapshot();
 
-    Database restored;
+    Database restored(singleShardBuckets(), kOneShard);
     restored.restore(entries);
     restored.setMaxMemory(limitForEntries(3));
     CHECK_EQ(restored.size(), std::size_t{3});
@@ -390,7 +405,9 @@ VCACHE_TEST(EvictionUnderConcurrentLoadStaysConsistent) {
     // while readers promote other nodes under a shared one. This is the test
     // that would expose a mistake in that split, under ThreadSanitizer.
     Database db;
-    db.setMaxMemory(limitForEntries(50));
+    // Scaled to the shard count: eviction leaves at least one entry per shard,
+    // so a limit below shardCount entries cannot be met. See Database.h.
+    db.setMaxMemory(limitForEntries(db.shardCount() * 4));
 
     std::vector<std::thread> threads;
     for (int t = 0; t < 6; ++t) {
@@ -434,7 +451,7 @@ VCACHE_TEST(ConcurrentReadsPromoteWithoutCorruptingTheList) {
     // test artifact -- see the note in Database.h. Bounding the loops means
     // this test measures recency-list integrity rather than lock fairness.
     Database db;
-    db.setMaxMemory(limitForEntries(20));
+    db.setMaxMemory(limitForEntries(db.shardCount() * 4));
     for (int i = 0; i < 10; ++i) {
         db.set("shared" + std::to_string(i), valueOfSize(kValueSize));
     }
@@ -465,6 +482,159 @@ VCACHE_TEST(ConcurrentReadsPromoteWithoutCorruptingTheList) {
 
     CHECK(db.memoryUsage() <= db.maxMemory());
     CHECK_EQ(db.keys().size(), db.size());
+}
+
+// ------------------------------------------------------------- sharding ----
+
+VCACHE_TEST(ShardCountIsRoundedUpToAPowerOfTwo) {
+    // Shard selection masks bits, which is only a valid modulo on a power of
+    // two. A request for 5 must become 8 rather than silently misrouting keys.
+    CHECK_EQ(Database(16, 1).shardCount(), std::size_t{1});
+    CHECK_EQ(Database(16, 5).shardCount(), std::size_t{8});
+    CHECK_EQ(Database(16, 16).shardCount(), std::size_t{16});
+    CHECK_EQ(Database(16, 0).shardCount(), std::size_t{1});  // zero is meaningless
+}
+
+VCACHE_TEST(EveryKeyIsReachableWhicheverShardItLandsIn) {
+    // Routing must be a pure function of the key: written to one shard, found
+    // in the same one. A hash mismatch between put and get would show up as
+    // keys that vanish.
+    Database db(1024, 16);
+    constexpr int kCount = 20000;
+
+    for (int i = 0; i < kCount; ++i) {
+        db.set("key" + std::to_string(i), "value" + std::to_string(i));
+    }
+    CHECK_EQ(db.size(), std::size_t{kCount});
+
+    for (int i = 0; i < kCount; ++i) {
+        const auto value = db.get("key" + std::to_string(i));
+        CHECK(value.has_value());
+        CHECK_EQ(*value, "value" + std::to_string(i));
+    }
+    CHECK_EQ(db.keys().size(), std::size_t{kCount});
+}
+
+VCACHE_TEST(KeysSpreadEvenlyAcrossShards) {
+    // Shard selection takes the HIGH bits of the hash and the bucket index
+    // takes the LOW bits. If both came from the same end, every key in a shard
+    // would also share a bucket -- one giant collision chain per shard.
+    //
+    // Measured through bucket counts: even spreading means shards grow their
+    // tables to similar sizes.
+    Database db(16, 16);
+    for (int i = 0; i < 16000; ++i) {
+        db.set("user:" + std::to_string(i), "v");
+    }
+
+    CHECK_EQ(db.size(), std::size_t{16000});
+
+    // 16000 keys over 16 shards is 1000 each; at a 0.75 load factor that is
+    // 2048 buckets per shard, so about 32768 in total. Wild imbalance would
+    // push the total far above that.
+    const std::size_t buckets = db.bucketCount();
+    CHECK(buckets >= std::size_t{16 * 1024});
+    CHECK(buckets <= std::size_t{16 * 8192});
+}
+
+VCACHE_TEST(ShardedEvictionKeepsTotalMemoryBounded) {
+    // The guarantee that survives sharding: the total stays under the limit.
+    // Which particular key goes is what becomes approximate.
+    Database db(256, 16);
+    db.setMaxMemory(limitForEntries(16 * 10));  // ten entries per shard
+
+    for (int i = 0; i < 5000; ++i) {
+        db.set("key" + std::to_string(i), valueOfSize(kValueSize));
+    }
+
+    CHECK(db.memoryUsage() <= db.maxMemory());
+    CHECK(db.evictedCount() > std::size_t{0});
+    CHECK_EQ(db.keys().size(), db.size());
+}
+
+VCACHE_TEST(ShardedEvictionIsApproximateNotExactLru) {
+    // Documents the cost of sharding rather than pretending it away.
+    //
+    // Five keys over sixteen shards, with room for four. Each shard holds at
+    // most one of them and is under its own slice of the budget, so NOTHING is
+    // evicted -- the globally-oldest key survives, and the total sits above the
+    // configured limit because eviction never takes a shard below one entry.
+    Database sharded(16, 16);
+    sharded.setMaxMemory(limitForEntries(4));
+
+    for (const char* key : {"first", "second", "third", "fourth", "fifth"}) {
+        sharded.set(key, valueOfSize(kValueSize));
+    }
+
+    CHECK_EQ(sharded.evictedCount(), std::size_t{0});   // no shard was over
+    CHECK(sharded.exists("first"));                     // the oldest survived
+
+    // The same sequence through one shard evicts exactly the oldest key.
+    Database exact(16, 1);
+    exact.setMaxMemory(limitForEntries(4));
+    for (const char* key : {"first", "second", "third", "fourth", "fifth"}) {
+        exact.set(key, valueOfSize(kValueSize));
+    }
+
+    CHECK(!exact.exists("first"));
+    CHECK(exact.exists("fifth"));
+    CHECK_EQ(exact.evictedCount(), std::size_t{1});
+}
+
+VCACHE_TEST(TheLimitIsHonouredOnceItExceedsTheShardFloor) {
+    // The bound does hold, provided the budget is above the floor of one entry
+    // per shard. Below that, eviction cannot get there -- see Database.h.
+    Database db(256, 16);
+    db.setMaxMemory(limitForEntries(16 * 8));  // eight entries per shard
+
+    for (int i = 0; i < 4000; ++i) {
+        db.set("key" + std::to_string(i), valueOfSize(kValueSize));
+    }
+
+    CHECK(db.memoryUsage() <= db.maxMemory());
+    CHECK(db.evictedCount() > std::size_t{0});
+}
+
+VCACHE_TEST(ShardsAreWrittenInParallelWithoutLoss) {
+    // The point of the whole exercise: many threads writing at once, each
+    // touching whichever shard its key hashes to.
+    Database db(1024, 16);
+    constexpr int kThreads = 8;
+    constexpr int kPerThread = 5000;
+
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&db, t] {
+            for (int i = 0; i < kPerThread; ++i) {
+                db.set("t" + std::to_string(t) + ":" + std::to_string(i), "v");
+            }
+        });
+    }
+    for (std::thread& thread : threads) {
+        thread.join();
+    }
+
+    CHECK_EQ(db.size(), std::size_t{kThreads * kPerThread});
+    for (int t = 0; t < kThreads; ++t) {
+        for (int i = 0; i < kPerThread; i += 97) {
+            CHECK(db.exists("t" + std::to_string(t) + ":" + std::to_string(i)));
+        }
+    }
+}
+
+VCACHE_TEST(ASingleShardBehavesLikeTheUnshardedDatabase) {
+    // The escape hatch works: shardCount 1 is the old behaviour exactly.
+    Database db(64, 1);
+    CHECK_EQ(db.shardCount(), std::size_t{1});
+
+    for (int i = 0; i < 1000; ++i) {
+        db.set("key" + std::to_string(i), "v");
+    }
+    CHECK_EQ(db.size(), std::size_t{1000});
+    CHECK_EQ(db.keys().size(), std::size_t{1000});
+
+    db.clear();
+    CHECK_EQ(db.size(), std::size_t{0});
 }
 
 int main() {

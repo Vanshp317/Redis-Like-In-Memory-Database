@@ -97,6 +97,9 @@ void printUsage() {
                  "  --save-interval <seconds>\n"
                  "                   Automatic snapshot interval (default 0, meaning\n"
                  "                   manual SAVE only). Requires --dbfile.\n"
+                 "  --shards <n>     Independently locked slices of the keyspace\n"
+                 "                   (default 64). More shards means less contention\n"
+                 "                   between concurrent clients.\n"
                  "  --max-memory <size>\n"
                  "                   Memory ceiling, e.g. 100MB or 512kb or 1048576.\n"
                  "                   Suffixes are 1024-based. Past it, the least\n"
@@ -117,7 +120,7 @@ bool parseArguments(int argc, char** argv, vcache::ServerConfig& config, bool& s
 
         if (argument == "--port" || argument == "--bind" || argument == "--threads" ||
             argument == "--dbfile" || argument == "--save-interval" ||
-            argument == "--max-memory") {
+            argument == "--max-memory" || argument == "--shards") {
             if (i + 1 >= argc) {
                 std::cerr << "error: " << argument << " requires a value\n";
                 return false;
@@ -185,6 +188,8 @@ bool parseArguments(int argc, char** argv, vcache::ServerConfig& config, bool& s
 
             if (isPort) {
                 config.port = static_cast<std::uint16_t>(number);
+            } else if (argument == "--shards") {
+                config.shardCount = static_cast<std::size_t>(number);
             } else {
                 config.threadCount = static_cast<std::size_t>(number);
             }
@@ -218,7 +223,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    vcache::Database database;
+    vcache::Database database(vcache::HashTable::kDefaultBucketCount, config.shardCount);
     vcache::Server server(database, config);
 
     if (!server.start()) {
@@ -231,7 +236,8 @@ int main(int argc, char** argv) {
     std::signal(SIGTERM, handleSignal);
 
     std::cout << "VCache listening on " << config.bindAddress << ":" << server.port() << "\n"
-              << config.threadCount << " worker threads\n";
+              << config.threadCount << " worker threads, " << database.shardCount()
+              << " shards\n";
 
     if (config.snapshotPath.empty()) {
         std::cout << "Persistence: off (no --dbfile)\n";

@@ -88,8 +88,9 @@ GET username
 (nil)
 ```
 
-`--bind <addr>` changes the listen address (default `127.0.0.1`) and `--threads <n>` the worker
-count (default 64). Ctrl+C shuts down cleanly, even with clients still connected. Networking is
+`--bind <addr>` changes the listen address (default `127.0.0.1`), `--threads <n>` the worker count
+(default 64), and `--shards <n>` the number of independently locked slices of the keyspace
+(default 64). Ctrl+C shuts down cleanly, even with clients still connected. Networking is
 POSIX-only (macOS/Linux); there is no Winsock path.
 
 To keep data across restarts:
@@ -464,8 +465,9 @@ Headlines from an M3 Pro:
 - **652,000 ops/sec** pipelined from one client — the 10× gap over un-pipelined is network round
   trip, not database work.
 - The custom hash table is **0.69×** `std::unordered_map` on lookup hits and **2.36×** on misses.
-- Throughput peaks at **two threads**. The single global lock is the ceiling; sharding it is the
-  highest-value next change.
+- The keyspace is **sharded across 64 independently locked slices**, which took throughput from
+  1.0M ops/sec at eight threads to **10.7M** — a 10.5× gain, and it now scales with thread count
+  instead of peaking at two.
 
 ```sh
 cmake -S . -B build && cmake --build build -j

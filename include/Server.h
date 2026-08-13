@@ -67,6 +67,10 @@ struct ServerConfig {
     // trusted, start() FAILS rather than starting empty -- see Server.cpp.
     bool restoreOnStart = true;
 
+    // Independently locked slices of the keyspace. More shards means less lock
+    // contention between concurrent clients; see the note in Database.h.
+    std::size_t shardCount = Database::kDefaultShardCount;
+
     // Memory ceiling in bytes; zero means unlimited and nothing is evicted.
     // Setting it also turns on recency tracking, which costs a little on every
     // GET -- see the eviction note in Database.h.
