@@ -1,5 +1,7 @@
 # VCache
 
+[![CI](https://github.com/Vanshp317/Redis-Like-In-Memory-Database/actions/workflows/ci.yml/badge.svg)](https://github.com/Vanshp317/Redis-Like-In-Memory-Database/actions/workflows/ci.yml)
+
 A Redis-inspired, single-node, in-memory key-value database written from scratch in C++17.
 
 Clients connect over TCP and speak a simple text protocol. The project is built bottom-up in

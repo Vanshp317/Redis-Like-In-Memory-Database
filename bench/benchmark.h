@@ -22,6 +22,7 @@
 // allocator or load. They are one machine, stated at the top of every report.
 
 #include <sys/resource.h>
+#include <unistd.h>  // sysconf(_SC_PAGESIZE) on the Linux path
 #ifdef __APPLE__
 #include <mach/mach.h>
 #endif

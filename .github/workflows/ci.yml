@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # Linux and macOS both build, because the networking layer has
+  # platform-conditional code: SO_NOSIGPIPE on BSD/macOS versus MSG_NOSIGNAL on
+  # Linux. Building on only one of them leaves the other branch unverified.
+  test:
+    name: build & test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  # A green test run says the code works on this scheduling. The sanitizers say
+  # it is actually correct -- data races and memory errors hide for thousands of
+  # passing runs, so these are the jobs that matter.
+  sanitizers:
+    name: ${{ matrix.sanitizer }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sanitizer: AddressSanitizer + UBSan
+            flag: -DVCACHE_ENABLE_ASAN=ON
+          - sanitizer: ThreadSanitizer
+            flag: -DVCACHE_ENABLE_TSAN=ON
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+          -DVCACHE_BUILD_BENCHMARKS=OFF ${{ matrix.flag }}
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
